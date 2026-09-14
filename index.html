@@ -338,11 +338,30 @@ function calc(d){
   var tax   = num(d.tax) || 0;
   var charged = price + tax;
 
-  var refundExp = price * (num(d.refundPct) || 0);
+  /* Two ways a deal can be written:
+       percent — they send back a share of the price
+       flat    — they send back everything above a fixed amount you keep paying
+     With a flat deal the fixed amount can be measured against the price alone
+     or against the whole charge including tax, and that changes the answer. */
+  var refundExp, taxExp;
+  if (d.refundMode === 'flat') {
+    var keep = num(d.flatCost) || 0;
+    if (d.flatBase === 'charged') {
+      refundExp = Math.max(0, charged - keep);   // tax is folded into the one refund
+      taxExp = 0;
+    } else {
+      refundExp = Math.max(0, price - keep);
+      taxExp = d.taxRefunded ? tax : 0;
+    }
+  } else {
+    refundExp = price * (num(d.refundPct) || 0);
+    taxExp = d.taxRefunded ? tax : 0;
+  }
+  var effPct = price > 0 ? refundExp / price : 0;
+
   var refundAct = num(d.refundGot);
   var refund = (refundAct === null) ? refundExp : refundAct;
 
-  var taxExp = d.taxRefunded ? tax : 0;
   var taxAct = num(d.taxGot);
   var taxIn = (taxAct === null) ? taxExp : taxAct;
 
@@ -377,6 +396,7 @@ function calc(d){
 
   return {
     charged:charged, refundExp:refundExp, refund:refund, taxExp:taxExp, taxIn:taxIn,
+    effPct:effPct,
     points:points, pointsPct:pointsPct, feePct:feePct, netCost:netCost, breakeven:breakeven,
     owed:owed, settled:settled, shortfall:shortfall,
     sale:sale, fees:fees, profit:profit,
@@ -440,6 +460,9 @@ var formOpen = false, editingId = null;
 function formHTML(d){
   d = d || {};
   var s = S.settings;
+  var mode = d.refundMode === 'flat'
+    ? (d.flatBase === 'charged' ? 'flat-charged' : 'flat-price')
+    : 'percent';
   return ''
   + '<div class="grid">'
   + '  <div class="full"><label for="f-item">Item</label>'
@@ -450,10 +473,19 @@ function formHTML(d){
   + '    <input id="f-price" type="number" step="0.01" inputmode="decimal" placeholder="100.00" value="'+esc(d.price==null?'':d.price)+'"></div>'
   + '  <div><label for="f-tax">Tax charged</label>'
   + '    <input id="f-tax" type="number" step="0.01" inputmode="decimal" placeholder="7.00" value="'+esc(d.tax==null?'':d.tax)+'"></div>'
-  + '  <div><label for="f-refund">Refund percentage</label>'
+  + '  <div class="full"><label for="f-mode">How the refund is written</label>'
+  + '    <select id="f-mode">'
+  + '      <option value="percent"'+(mode==='percent'?' selected':'')+'>A percentage of the price</option>'
+  + '      <option value="flat-price"'+(mode==='flat-price'?' selected':'')+'>A fixed amount I keep paying, off the price</option>'
+  + '      <option value="flat-charged"'+(mode==='flat-charged'?' selected':'')+'>A fixed amount I keep paying, off the whole charge</option>'
+  + '    </select></div>'
+  + '  <div id="wrap-refund"><label for="f-refund">Refund percentage</label>'
   + '    <input id="f-refund" type="number" step="1" inputmode="decimal" placeholder="85" value="'+esc(d.refundPct==null?'':Math.round(d.refundPct*1000)/10)+'">'
   + '    <div class="hint">Percent of the price before tax</div></div>'
-  + '  <div><label for="f-taxref">Tax refunded too?</label>'
+  + '  <div id="wrap-flat"><label for="f-flat">What it costs you</label>'
+  + '    <input id="f-flat" type="number" step="0.01" inputmode="decimal" placeholder="50.00" value="'+esc(d.flatCost==null?'':d.flatCost)+'">'
+  + '    <div class="hint" id="flat-hint">They refund everything above this</div></div>'
+  + '  <div id="wrap-taxref"><label for="f-taxref">Tax refunded too?</label>'
   + '    <select id="f-taxref">'
   + '      <option value="no"'+(d.taxRefunded?'':' selected')+'>No</option>'
   + '      <option value="yes"'+(d.taxRefunded?' selected':'')+'>Yes</option>'
@@ -487,13 +519,17 @@ function formHTML(d){
 function formValues(){
   var g = function(id){ var e = document.getElementById(id); return e ? e.value : ''; };
   var p = function(id){ var v = num(g(id)); return v === null ? null : v / 100; };
+  var mode = g('f-mode') || 'percent';
   return {
     item: g('f-item').trim(),
     link: g('f-link').trim(),
     price: num(g('f-price')),
     tax: num(g('f-tax')) || 0,
+    refundMode: mode === 'percent' ? 'percent' : 'flat',
+    flatBase: mode === 'flat-charged' ? 'charged' : 'price',
+    flatCost: num(g('f-flat')),
     refundPct: p('f-refund'),
-    taxRefunded: g('f-taxref') === 'yes',
+    taxRefunded: mode === 'flat-charged' ? false : (g('f-taxref') === 'yes'),
     pointsPct: p('f-points'),
     feePct: p('f-fee'),
     orderDate: g('f-order'),
@@ -503,14 +539,31 @@ function formValues(){
   };
 }
 
+function syncFormMode(){
+  var sel = document.getElementById('f-mode');
+  if (!sel) return;
+  var mode = sel.value;
+  var flat = mode !== 'percent';
+  document.getElementById('wrap-refund').hidden = flat;
+  document.getElementById('wrap-flat').hidden = !flat;
+  document.getElementById('wrap-taxref').hidden = (mode === 'flat-charged');
+  var hint = document.getElementById('flat-hint');
+  if (hint) {
+    hint.textContent = mode === 'flat-charged'
+      ? 'Your total out of pocket, tax included'
+      : 'Your cost before tax. Tax is handled separately.';
+  }
+}
+
 function paintReadout(){
   var el = document.getElementById('readout');
   if (!el) return;
   var v = formValues();
-  if (v.price === null || v.price <= 0 || v.refundPct === null) {
+  var termsSet = v.refundMode === 'flat' ? v.flatCost !== null : v.refundPct !== null;
+  if (v.price === null || v.price <= 0 || !termsSet) {
     el.classList.add('idle');
     el.innerHTML = '<div><div class="big">$0.00</div>'
-      + '<div class="lab">Enter a price and refund percentage</div></div>';
+      + '<div class="lab">Enter a price and the refund terms</div></div>';
     return;
   }
   var c = calc(v);
@@ -536,10 +589,14 @@ function openForm(id){
   f.hidden = false;
   formOpen = true;
   document.getElementById('btnNew').textContent = editingId ? 'Editing a deal' : 'Adding a deal';
-  ['f-price','f-tax','f-refund','f-taxref','f-points','f-fee'].forEach(function(id){
+  ['f-price','f-tax','f-refund','f-flat','f-taxref','f-points','f-fee'].forEach(function(id){
     var e = document.getElementById(id);
     if (e) { e.addEventListener('input', paintReadout); e.addEventListener('change', paintReadout); }
   });
+  document.getElementById('f-mode').addEventListener('change', function(){
+    syncFormMode(); paintReadout();
+  });
+  syncFormMode();
   document.getElementById('f-save').addEventListener('click', saveForm);
   document.getElementById('f-cancel').addEventListener('click', closeForm);
   paintReadout();
@@ -557,7 +614,11 @@ function saveForm(){
   var v = formValues();
   if (!v.item) { toast('Give the item a name.'); document.getElementById('f-item').focus(); return; }
   if (v.price === null || v.price <= 0) { toast('Enter the price you paid.'); document.getElementById('f-price').focus(); return; }
-  if (v.refundPct === null) { toast('Enter the refund percentage.'); document.getElementById('f-refund').focus(); return; }
+  if (v.refundMode === 'flat') {
+    if (v.flatCost === null) { toast('Enter what the deal costs you.'); document.getElementById('f-flat').focus(); return; }
+  } else if (v.refundPct === null) {
+    toast('Enter the refund percentage.'); document.getElementById('f-refund').focus(); return;
+  }
 
   if (editingId) {
     var d = S.deals.find(function(x){ return x.id === editingId; });
@@ -689,6 +750,11 @@ function detailHTML(d, c){
     +   '<option value="yes"'+(d.dead?' selected':'')+'>Yes, gave up</option>'
     + '</select></div></div>';
   h += '<div class="facts">'
+    + (d.refundMode === 'flat'
+        ? 'Costs you <b>' + money(d.flatCost) + '</b>'
+          + (d.flatBase === 'charged' ? ' all in' : ' before tax')
+          + ' &nbsp;·&nbsp; works out to ' + pct(c.effPct) + ' back<br>'
+        : '')
     + 'Expected <b>' + money(c.refundExp + c.taxExp) + '</b>'
     + ' &nbsp;·&nbsp; net cost <b>' + money(c.netCost) + '</b>'
     + ' &nbsp;·&nbsp; points <b>' + money(c.points) + '</b>'
@@ -815,7 +881,7 @@ function csv(){
     lines.push([
       state(d), d.item, d.link, d.orderDate, d.arrivalDate, iso(c.eligible),
       d.reviewType, d.reviewDone ? 'Yes' : 'No',
-      d.price, d.tax, d.refundPct, d.taxRefunded ? 'Yes' : 'No', c.pointsPct,
+      d.price, d.tax, c.effPct, c.taxExp > 0 ? 'Yes' : 'No', c.pointsPct,
       r2(c.refundExp), d.refundGot, r2(c.taxExp), d.taxGot, c.shortfall === null ? '' : r2(c.shortfall),
       r2(c.points), r2(c.netCost), c.feePct, r2(c.breakeven),
       d.saleDate, d.salePrice, c.fees === null ? '' : r2(c.fees),
@@ -852,8 +918,8 @@ function pushToSheet(){
       status: state(d), item: d.item, link: d.link,
       orderDate: d.orderDate, arrivalDate: d.arrivalDate, eligible: iso(c.eligible),
       reviewType: d.reviewType, reviewDone: d.reviewDone ? 'Yes' : 'No',
-      price: d.price, tax: d.tax, refundPct: d.refundPct,
-      taxRefunded: d.taxRefunded ? 'Yes' : 'No', pointsPct: c.pointsPct,
+      price: d.price, tax: d.tax, refundPct: c.effPct,
+      taxRefunded: c.taxExp > 0 ? 'Yes' : 'No', pointsPct: c.pointsPct,
       refundGot: d.refundGot, taxGot: d.taxGot, feePct: c.feePct,
       saleDate: d.saleDate, salePrice: d.salePrice, notes: d.notes
     };
